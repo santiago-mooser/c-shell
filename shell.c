@@ -7,70 +7,19 @@
 #include <signal.h>
 #include <unistd.h>
 #include <errno.h>
-
-#include "COMP3230_signal.h"
-
-#define OK       0
-#define NO_INPUT 1
-#define TOO_LONG 2
-
-int cont = 0;
-
-/* Helper function: Write a string to a descriptor, keeping errno unchanged.
-   Returns 0 if success, errno error code if an error occurs. */
-static inline int  wrs(const int fd, const char *s)
-{
-    /* Invalid descriptor? */
-    if (fd == -1)
-        return EBADF;
-
-    /* Anything to actually write? */
-    if (s && *s) {
-        const int   saved_errno = errno;
-        const char *z = s;
-        ssize_t     n;
-        int         err = 0;
-
-        /* Use a loop to find end of s, since strlen() is not async-signal safe. */
-        while (*z)
-            z++;
-
-        /* Write the string, ignoring EINTR, and allowing short writes. */
-        while (s < z) {
-            n = write(fd, s, (size_t)(z - s));
-            if (n > 0)
-                s += n;
-            else
-            if (n != -1) {
-                /* This should never occur, so it's an I/O error. */
-                err = EIO;
-                break;
-            } else
-            if (errno != EINTR) {
-                /* An actual error occurred. */
-                err = errno;
-                break;
-            }
-        }
-
-        errno = saved_errno;
-        return err;
-
-    } else {
-        /* Nothing to write. NULL s is silently ignored without error. */
-        return 0;
-    }
-}
+#include <sys/types.h>
+#include <sys/wait.h>
 
 /* Signal handler. Just outputs a line to standard error. */
-void catcher(int signum)
-{
+void catcher(int signum){
     switch (signum) {
     case SIGINT:
-        wrs(STDERR_FILENO, "\n$$ 3230shell ## ");
+        printf("\n$$ 3230shell ## ");
+        fflush(stdout);
         return;
     default:
-        wrs(STDERR_FILENO, "Caught a signal.\n");
+        printf("Caught a signal.\n");
+        fflush(stdout);
         return;
     }
 }
@@ -92,7 +41,7 @@ int install_catcher(const int signum)
 }
 
 
-// parses the input line to construct the command name(s) and the associated argument list(s)
+/* parse the input line to construct the command name(s) and the associated argument list(s) */
 int parse( char* shell_input, char **args ){
 
     char *token;
@@ -109,40 +58,70 @@ int parse( char* shell_input, char **args ){
 }
 
 
+int execute(int argc, char *argv[]){
 
-int execute(int argc, char *args[]){
-
-    char *cmd = args[0];
-    // if the command is exit, then exit the shell
-    if (strcmp(cmd, "exit") == 0){
+    /* if the command is exit, then exit the shell */
+    if (strcmp(argv[0], "exit") == 0){
         exit(0);
-    }
 
-    // if the command is cd, then change the directory
-    if (strcmp(cmd, "cd\n") == 0){
+    /* If the command is cd, change working directory*/
+    } else if (strcmp(argv[0], "cd") == 0){
         if (argc == 1){
             chdir(getenv("HOME"));
         } else {
-            chdir(args[1]);
+            chdir(argv[1]);
         }
         return 0;
     }
 
-    // if the command is pwd, then print the current working directory
-    if (strcmp(cmd, "pwd\n") == 0){
-        char cwd[1024];
-        getcwd(cwd, sizeof(cwd));
-        printf("%s\n", cwd);
-    }
+    /* Initialize pipe */
+    int     fd[2], nbytes;
+    char    readbuffer[10000] = {};
+    enum {WR, RD};
+    if (pipe(fd) < 0)
+        perror("pipe error");
 
-    // use fork to create a child process
-    pid_t pid = fork();
-    //Then execute the command with the arguments
-    if (pid == 0){
-        execvp(cmd, args);
-        exit(0);
+    /* use fork to create a child process */
+    pid_t pid;
+    if((pid = fork()) == -1) {
+        perror("fork");
+        return -1;
+
+    } else if (pid == 0){
+       /* If successful, close the read side of the pipe and execute the command with the arguments */
+        close(fd[WR]);
+        dup2(fd[RD], STDOUT_FILENO);
+        int status = execvp(argv[0], argv);
+        /* If something goes wrong, exit with an error */
+        _exit(status);
     } else {
-        wait(NULL);
+        /* close output side of pipe in parent process */
+        close(fd[RD]);
+
+        /* Get exit status of child*/
+        int status;
+        waitpid(pid, &status, 0);
+
+        /* If the status of the child is not zero, print the error message */
+        if (WEXITSTATUS(status) >= 0 && WEXITSTATUS(status) <= 127){
+            /* If the status of the child is zero, read the output of the command and print it */
+            nbytes = read(fd[WR], readbuffer, sizeof(readbuffer));
+            printf("%s", readbuffer);
+            return 0;
+        } else if (WEXITSTATUS(status) == 255) {
+            if (access(argv[0], F_OK) == 0) {
+                // file exists
+                printf("'%s': Permission denied\n", argv[0]);
+                return 127;
+            } else {
+                // file doesn't exist
+                printf("'%s': No such file or directory\n", argv[0]);
+                return 127;
+            }
+        } else {
+            printf("'%s': Command not found\n", argv[0]);
+            return 127;
+        }
     }
 }
 
@@ -156,30 +135,52 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // check for correct number of arguments
+    /* Declare variables */
     char   *line = NULL;
     size_t  size = 0;
     ssize_t len;
-
         // print prompt
 
 
     while (1) {
         printf ( "$$ 3230shell ## " );
+        fflush(stdout);
+        fflush(stdin);
+
+        /* Reset file variables */
+        line = NULL;
+        size = 0;
+        len = -1;
+
+        /* Read a line from stdin, ignoring EINTR. */
         len = getline(&line, &size, stdin);
+
+        /* If the length is less than zero, there was an error reading the line */
         if (len < 0){
             break;
         }
 
-        if (!strcmp(line, "exit\n") || !strcmp(line, "quit\n")){
-            break;
+        /* Clean string by removing newlines, return carriages and spaces */
+        while (len > 0 && line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' '){
+            line[len - 1] = '\0';
+            len--;
         }
-        // parse command line
-        char *args[30];
-        int num_of_args;
+
+
+        /* If the length is zero, just continue. This is to prevent execution when only a newline character is added. */
+        if ( len == 0 ){
+            continue;
+        }
+
+        /* parse command line */
+        char *args[1024] = {};
+        int num_of_args = 0;
         num_of_args = parse(line, args);
 
-        execute(num_of_args, args);
+        int result = execute(num_of_args, args);
+        if (result <0){
+            printf("Error executing command");
+        }
         //print out args
         // int d = 0;
         // while (d < num_of_args){
@@ -189,4 +190,5 @@ int main(int argc, char *argv[]) {
         // }
     }
 
+    exit;
 }
