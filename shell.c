@@ -15,6 +15,10 @@ void catcher(int signum){
         printf("\n$$ 3230shell ## ");
         fflush(stdout);
         return;
+    case SIGCHLD:
+        printf("\n$$ 3230shell ## ");
+        fflush(stdout);
+        return;
     default:
         printf("Caught a signal.\n");
         fflush(stdout);
@@ -40,40 +44,114 @@ int install_catcher(const int signum)
 
 
 /* parse the input line to construct the command name(s) and the associated argument list(s) */
-int parse( char* shell_input, char *args[5][1024] ){
+int parse( char* line, char *args[5][1024] ){
+
+    char    *input = NULL;
+    size_t  buffer_size = 32;
+    ssize_t char_len, char_len_input;
+
+    /* Read a line from stdin, ignoring EINTR. */
+    char_len = getline(&line, &buffer_size, stdin);
+
+    /* If the length is less than zero, there was an error reading the line. */
+    /* Respond accordingly */
+    if (char_len < 0){
+        if (errno == EINTR){
+            return -1;
+        } else {
+            perror("getline");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    /* Clean string by removing newlines, return carriages and spaces */
+    while (char_len > 0 && line[char_len - 1] == '\n' || line[char_len - 1] == '\r' || line[char_len - 1] == ' '){
+        line[char_len - 1] = '\0';
+        char_len--;
+    }
+    /* If the last character is a '\' then continue collecting input and concatenate it to the input string after removing the '\' character */
+    while (line[char_len - 1] == '\\'){
+        line[char_len - 1] = '\0';
+        char_len--;
+        char_len_input = getline(&input, &buffer_size, stdin);
+        while (char_len > 0 && input[char_len_input - 1] == '\n' || input[char_len_input - 1] == '\r' || input[char_len_input - 1] == ' '){
+            input[char_len_input - 1] = '\0';
+            char_len_input--;
+        }
+        line = strcat(line, input);
+    }
+
+    while (char_len > 0 && line[char_len - 1] == '\n' || line[char_len - 1] == '\r' || line[char_len - 1] == ' '){
+        line[char_len - 1] = '\0';
+        char_len--;
+    }
+
+    /* If the length is zero, just continue. This is to prevent execution when only a newline character is added. */
+    if ( char_len == 0 ){
+        return -1;
+    }
+
 
     /* Iterate over the shell input and separate string based on spaces */
     char *token;
     char *token_inner;
-    token = strtok(shell_input, "|");
+    token = strtok(line, " ");
 
-
-    int i = 0;
-    int j = 0;
-    char *line;
+    int params_index = 0;
+    char *temp[1024];
     while (token != NULL){
-        j=0;
-        args[i][j] = token;
-        token_inner = strtok(args[i][j], " ");
-        while (token_inner != NULL){
-            args[i][j] = token_inner;
-            token_inner = strtok(NULL, " ");
-            j++;
-        }
-        token = strtok(NULL, "|");
-        i++;
+        temp[params_index] = token;
+        token = strtok(NULL, " ");
+        params_index++;
     }
 
-    return i;
+    /*
+        Command_index is used to keep track of the index of a full command --including parameters
+        Foro example, if the user inputs "ls -l | grep 3230", then command_index will be 0 for the first command "ls -l" and 1 for the second command "grep 3230"
+    */
+    int command_index = 0;
+    /*
+        arg_index is used to keep track of the index of the start of a command. For example, if the user inputs "ls -l | grep 3230", then arg_index will be 0 for the first command "ls" and 3 for the second command "grep".
+    */
+    int arg_index = 0;
+
+    /* Iterate over temp string to see if any string is a pipe "|" or a background operator "&" */
+    for (int j = 0; j < params_index; j++){
+
+        /* If the current string is a pipe, the next command goes in the next command_index */
+        if (strcmp(temp[j], "|") == 0){
+
+            /* If the next string is also a pipe, exit with an error */
+            if (strcmp(temp[j+1], "|") == 0){
+                printf("3230shell: should not have two consecutive | without in-between command\n");
+                return -1;
+            }
+
+            command_index++;
+            arg_index = 0;
+            continue;
+        }
+
+        args[command_index][arg_index] = temp[j];
+        arg_index++;
+    }
+
+    free(input);
+
+    return command_index + 1;
 }
 
 
-int execute(int argc, char *argv[][1024]){
+int execute(int argc, char *argv[5][1024]){
 
 
     /* if the command is exit, then exit the shell */
     if (strcmp(argv[0][0], "exit") == 0){
-        exit(0);
+        /* If there are any other parameters, return error code */
+        if (argv[0][1] != NULL){
+            printf("3230shell: \"exit\" with other arguments!!!\n");
+            return -1;
+        }
 
     /* If the command is cd, change working directory*/
     } else if (strcmp(argv[0][0], "cd") == 0){
@@ -196,69 +274,26 @@ int main(int argc, char *argv[]) {
 
         /* Declare/reinitialize variables so we can reuse them */
         char    *line = NULL;
-        char    *input = NULL;
-        size_t  buffer_size = 32;
-        ssize_t char_len, char_len_input;
 
         /* Print the prompt */
         printf ( "$$ 3230shell ## " );
         fflush(stdout);
 
-        /* Read a line from stdin, ignoring EINTR. */
-        char_len = getline(&line, &buffer_size, stdin);
-
-        /* If the length is less than zero, there was an error reading the line. */
-        /* Respond accordingly */
-        if (char_len < 0){
-            if (errno == EINTR){
-                continue;
-            } else {
-                perror("getline");
-                exit(EXIT_FAILURE);
-            }
-        }
-
-        /* Clean string by removing newlines, return carriages and spaces */
-        while (char_len > 0 && line[char_len - 1] == '\n' || line[char_len - 1] == '\r' || line[char_len - 1] == ' '){
-            line[char_len - 1] = '\0';
-            char_len--;
-        }
-        /* If the last character is a '\' then continue collecting input and concatenate it to the input string after removing the '\' character */
-        while (line[char_len - 1] == '\\'){
-            line[char_len - 1] = '\0';
-            char_len--;
-            char_len_input = getline(&input, &buffer_size, stdin);
-            while (char_len > 0 && input[char_len_input - 1] == '\n' || input[char_len_input - 1] == '\r' || input[char_len_input - 1] == ' '){
-                input[char_len_input - 1] = '\0';
-                char_len_input--;
-            }
-            line = strcat(line, input);
-        }
-
-        while (char_len > 0 && line[char_len - 1] == '\n' || line[char_len - 1] == '\r' || line[char_len - 1] == ' '){
-            line[char_len - 1] = '\0';
-            char_len--;
-        }
-
-        /* If the length is zero, just continue. This is to prevent execution when only a newline character is added. */
-        if ( char_len == 0 ){
-            continue;
-        }
-
         /* parse command line */
         char *args[5][1024] = {};
         int num_of_args = 0;
         num_of_args = parse(line, args);
+
+        /* If the parsing fails, continue*/
         if (num_of_args == -1){
             continue;
         }
+
+        /* Otherwise execute parsed commands */
         execute(num_of_args, args);
 
         fflush(stdin);
-        /* Reset file variables */
+        /* Free & reset variables to save memory */
         free(line);
-        free(input);
-        buffer_size    = 0;
-        char_len     = -1;
     }
 }
