@@ -7,34 +7,78 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+
+/*
+Student name and No.:
+    Santiago Espinosa Mooser
+    3035557399
+
+Development platform:
+    Arch Linux (kernel 5.15.73-3-lts)
+    gcc (GCC) 12.2.0
+
+Remarks:
+    - The parsing does not allow parameters with quotation marks and a space. This would not work:
+
+        ls -al "folder name"
+
+    - timeX command is not implemented
+    - Background command is
+*/
+
+
+
+struct command {
+    char    *argv[5][1024];
+    int     timex[5];
+    int     argc;
+    int     isBackground;
+};
+
+
 
 /* Signal handler. Just outputs a line to standard error. */
-void catcher(int signum){
+void shell_catcher(int signum){
     switch (signum) {
     case SIGINT:
         printf("\n$$ 3230shell ## ");
         fflush(stdout);
         return;
-    case SIGCHLD:
-        printf("\n$$ 3230shell ## ");
-        fflush(stdout);
+    default:
+        return;
+    }
+}
+
+void child_catcher(int signum){
+    switch (signum) {
+    case SIGKILL:
+        printf("Killed");
+        return;
+    case SIGINT:
+        printf("Interrupted");
         return;
     default:
-        printf("Caught a signal.\n");
-        fflush(stdout);
         return;
     }
 }
 
 /* Helper function to install the signal handler. */
-int install_catcher(const int signum)
-{
+int install_catcher(const int signum, char *type){
+
     struct sigaction  act;
 
     memset(&act, 0, sizeof act);
     sigemptyset(&act.sa_mask);
 
-    act.sa_handler = catcher;
+    if (strcmp(type, "shell") == 0) {
+        act.sa_handler = shell_catcher;
+    } else if (strcmp(type, "child") == 0) {
+        act.sa_handler = child_catcher;
+    } else {
+        return -1;
+    }
+
     act.sa_flags = SA_RESTART;  /* Do not interrupt "slow" functions */
     if (sigaction(signum, &act, NULL) == -1)
         return -1;  /* Failed */
@@ -44,7 +88,7 @@ int install_catcher(const int signum)
 
 
 /* parse the input line to construct the command name(s) and the associated argument list(s) */
-int parse( char* line, char *args[5][1024] ){
+void parse( char* line, struct command* cmd ){
 
     char    *input = NULL;
     size_t  buffer_size = 32;
@@ -57,7 +101,8 @@ int parse( char* line, char *args[5][1024] ){
     /* Respond accordingly */
     if (char_len < 0){
         if (errno == EINTR){
-            return -1;
+            cmd->argc = -1;
+            return;
         } else {
             perror("getline");
             exit(EXIT_FAILURE);
@@ -88,7 +133,8 @@ int parse( char* line, char *args[5][1024] ){
 
     /* If the length is zero, just continue. This is to prevent execution when only a newline character is added. */
     if ( char_len == 0 ){
-        return -1;
+        cmd->argc = -1;
+        return;
     }
 
 
@@ -121,10 +167,22 @@ int parse( char* line, char *args[5][1024] ){
         /* If the current string is a pipe, the next command goes in the next command_index */
         if (strcmp(temp[j], "|") == 0){
 
+            /* If a pipe is the last character, simply continue */
+            if (j == params_index - 1){
+                continue;
+            }
+
             /* If the next string is also a pipe, exit with an error */
             if (strcmp(temp[j+1], "|") == 0){
                 printf("3230shell: should not have two consecutive | without in-between command\n");
-                return -1;
+                cmd->argc = -1;
+                return;
+            }
+
+            if (strcmp(temp[j+1], "&") == 0){
+                printf("3230shell: should not have & after |\n");
+                cmd->argc = -1;
+                return;
             }
 
             command_index++;
@@ -132,56 +190,57 @@ int parse( char* line, char *args[5][1024] ){
             continue;
         }
 
-        args[command_index][arg_index] = temp[j];
+        cmd->argv[command_index][arg_index] = temp[j];
         arg_index++;
     }
 
     free(input);
 
-    return command_index + 1;
+    cmd->argc = command_index + 1;
 }
 
 
-int execute(int argc, char *argv[5][1024]){
+int execute(struct command *cmd){
 
 
     /* if the command is exit, then exit the shell */
-    if (strcmp(argv[0][0], "exit") == 0){
+    if (strcmp(cmd->argv[0][0], "exit") == 0){
         /* If there are any other parameters, return error code */
-        if (argv[0][1] != NULL){
+        if (cmd->argv[0][1] != NULL){
             printf("3230shell: \"exit\" with other arguments!!!\n");
             return -1;
         }
+        exit(0);
 
     /* If the command is cd, change working directory*/
-    } else if (strcmp(argv[0][0], "cd") == 0){
-        if (strlen(argv[0][0]) == 1){
+    } else if (strcmp(cmd->argv[0][0], "cd") == 0){
+        if (strlen(cmd->argv[0][0]) == 1){
             chdir(getenv("HOME"));
         } else {
-            chdir(argv[0][1]);
+            chdir(cmd->argv[0][1]);
         }
         return 0;
     }
 
 
-    /* For every argv line, create a pipe and connect pipe. For the last pipe, connect it to the current program. */
-    int pipes[argc][2];
+    /* For every cmd->argv line, create a pipe and connect pipe. For the last pipe, connect it to the current program. */
+    int pipes[cmd->argc][2];
     enum {RD, WR};
-    pid_t pids[argc];
+    pid_t pids[cmd->argc];
 
     /* Finally, prepare some buffer for the parent program */
     int nbytes;
     char readbuffer[10000] = {};
 
     /* Create the pipe the processes are going to output to */
-    for (int z=0; z < argc; z++){
+    for (int z=0; z < cmd->argc; z++){
         if (pipe(pipes[z]) < 0){
             perror("pipe error");
         }
     }
 
     int i;
-    for (i = 0; i < argc; i++){
+    for (i = 0; i < cmd->argc; i++){
 
         /* Fork the process */
         if((pids[i] = fork()) == -1) {
@@ -205,59 +264,90 @@ int execute(int argc, char *argv[5][1024]){
                 printf("Unable to set STDOUT\n");
                 exit(1);
             }
+            /* Set STDERR to also output to the pipe */
+            if(dup2(pipes[i][WR], STDERR_FILENO) < 0){
+                printf("Unable to set STDERR\n");
+                exit(1);
+            }
+
             /* Close the pipes */
-            for (int z=0; z < argc; z++){
+            for (int z=0; z < cmd->argc; z++){
                 close(pipes[z][RD]);
                 close(pipes[z][WR]);
             }
 
+            /* Set the signal catchers */
+            char *type = "child";
+            install_catcher(SIGKILL, type);
+            install_catcher(SIGINT, type);
+
             /* Finally, simply execute the program */
-            execvp(argv[i][0], argv[i]);
+            execvp(cmd->argv[i][0], cmd->argv[i]);
             /* Exit with an error if the program is unable to be executed */
             exit(127);
         }
     }
 
+    struct rusage rusage;
+    int status;
+    int ret;
     /* Once the child processes have been created, close all pipes except the last one */
-    for (int z=0; z < argc-1; z++){
+    for (int z=0; z < cmd->argc-1; z++){
+        if (cmd->timex[z] == 1){
+            ret = wait4(pids[cmd->argc-1], &status, 0, &rusage);
+            printf("user time: %.6f, system time: %.6f\n",
+            rusage.ru_utime.tv_sec + rusage.ru_utime.tv_usec / 1000000.0,
+            rusage.ru_stime.tv_sec + rusage.ru_stime.tv_usec / 1000000.0);
+        }
         close(pipes[z][RD]);
         close(pipes[z][WR]);
     }
 
     /* Then also close the write end of the last pipe */
-    close(pipes[argc-1][WR]);
+    close(pipes[cmd->argc-1][WR]);
 
-    int status;
+
+
+
     /* Then, we obviously need to wait for the last process to finish */
-    waitpid(pids[argc-1], &status, 0);
+    ret = wait4(pids[cmd->argc-1], &status, 0, &rusage);
+    if (cmd->timex[cmd->argc-1] == 1){
+        ret = wait4(pids[cmd->argc-1], &status, 0, &rusage);
+        printf("user time: %.6f, system time: %.6f\n",
+        rusage.ru_utime.tv_sec + rusage.ru_utime.tv_usec / 1000000.0,
+        rusage.ru_stime.tv_sec + rusage.ru_stime.tv_usec / 1000000.0);
+    }
 
     /* And read the buffer */
-    nbytes = read(pipes[argc-1][RD], readbuffer, sizeof(readbuffer));
+    nbytes = read(pipes[cmd->argc-1][RD], readbuffer, sizeof(readbuffer));
     printf("%s", readbuffer);
     fflush(stdout);
 
-    /* Now we can check the exit status of the executed processes */
+    /* Now we can check the exit status of the executed processes and print out any errors */
 
-    /* If the status of the child is not an error, exit with that code*/
-    if (WEXITSTATUS(status) >= 0 && WEXITSTATUS(status) <= 127){
-        return WEXITSTATUS(status);
+    for (int i=0; i<cmd->argc; i++){
 
-    /* Otherwise print message to screen and exit */
-    } else if (WEXITSTATUS(status) == 255) {
-        if (access(argv[i][0], F_OK) == 0) {
-            // file exists
-            printf("'%s': Permission denied\n", argv[i][0]);
-            return 127;
-        } else {
-            // file doesn't exist
-            printf("'%s': No such file or directory\n", argv[i][0]);
+        /* If the status of the child is not an error, exit with that code*/
+        waitpid(pids[i], &status, 0);
+
+        /* Otherwise print message to screen and exit */
+        if (WEXITSTATUS(status) == 255) {
+            if (access(cmd->argv[i][0], F_OK) == 0) {
+                // file exists
+                printf("'%s': Permission denied\n", cmd->argv[i][0]);
+                return 127;
+            } else {
+                // file doesn't exist
+                printf("'%s': No such file or directory\n", cmd->argv[i][0]);
+                return 127;
+            }
+        } else if (WEXITSTATUS(status) == 127) {
+
+            printf("'%s': Command not found\n", cmd->argv[i][0]);
             return 127;
         }
-    } else {
-        printf("'%s': Command not found\n", argv[i][0]);
-        return 127;
     }
-
+    return WEXITSTATUS(status);
 }
 
 
@@ -265,7 +355,8 @@ int execute(int argc, char *argv[5][1024]){
 int main(int argc, char *argv[]) {
 
     // Register signal handler
-    if (install_catcher(SIGINT)) {
+    char *type = "shell";
+    if (install_catcher(SIGINT, type)) {
         fprintf(stderr, "Cannot install signal handler: %s.\n", strerror(errno));
         return EXIT_FAILURE;
     }
@@ -279,18 +370,22 @@ int main(int argc, char *argv[]) {
         printf ( "$$ 3230shell ## " );
         fflush(stdout);
 
+        /* Initialize comand structure */
+        struct command cmd={.isBackground = 0,
+                            .argv = {},
+                            .timex = {},
+                            .argc = 0};
+
         /* parse command line */
-        char *args[5][1024] = {};
-        int num_of_args = 0;
-        num_of_args = parse(line, args);
+        parse(line, &cmd);
 
         /* If the parsing fails, continue*/
-        if (num_of_args == -1){
+        if (cmd.argc == -1){
             continue;
         }
 
         /* Otherwise execute parsed commands */
-        execute(num_of_args, args);
+        execute(&cmd);
 
         fflush(stdin);
         /* Free & reset variables to save memory */
